@@ -18,9 +18,23 @@ if TYPE_CHECKING:
     from kaleido._utils import fig_tools
 
 
+
 _TEXT_FORMATS = ("svg", "json")  # eps
+_CHUNK_SIZE = 10 * 1024 * 1024  # 10 MB keeps messages under Chrome's pipe limit
 
 _logger = logistro.getLogger(__name__)
+
+
+def _estimate_json_size(spec):
+    """Cheaply estimate the JSON byte size of a spec from its data arrays."""
+    total = 0
+    for trace in spec.get("data", {}).get("data", []):
+        for v in trace.values():
+            if isinstance(v, dict) and "bdata" in v:
+                total += len(v["bdata"])
+            elif hasattr(v, "__len__") and not isinstance(v, (str, dict)):
+                total += len(v) * 12
+    return total
 
 
 def _subscribe_new(tab: choreo.Tab, event: str) -> asyncio.Future:
@@ -117,22 +131,29 @@ class _KaleidoTab:
         render_prof,
         stepper,
     ) -> bytes:
-        # js script
-        kaleido_js_fn = (
-            r"function(spec, ...args)"
-            r"{"
-            r"return kaleido_scopes.plotly(spec, ...args).then(JSON.stringify);"
-            r"}"
-        )
         render_prof.profile_log.tick("sending javascript")
-        result = await _dtools.exec_js_fn(
-            self.tab,
-            self._current_js_id,
-            kaleido_js_fn,
-            spec,
-            topojson,
-            stepper,
-        )
+
+        if _estimate_json_size(spec) > _CHUNK_SIZE:
+            result = await self._calc_fig_large(
+                spec,
+                topojson=topojson,
+                stepper=stepper,
+            )
+        else:
+            kaleido_js_fn = (
+                r"function(spec, ...args)"
+                r"{"
+                r"return kaleido_scopes.plotly(spec, ...args).then(JSON.stringify);"
+                r"}"
+            )
+            result = await _dtools.exec_js_fn(
+                self.tab,
+                self._current_js_id,
+                kaleido_js_fn,
+                spec,
+                topojson,
+                stepper,
+            )
         _raise_error(result)
         render_prof.profile_log.tick("javascript sent")
 
@@ -154,3 +175,80 @@ class _KaleidoTab:
         render_prof.data_out_size = len(res)
         render_prof.js_log = self.js_logger.log
         return res
+
+
+    async def _calc_fig_large(
+        self,
+        spec: fig_tools.Spec,
+        *,
+        topojson: str | None,
+        stepper,
+    ):
+        """
+        Handle large specs by streaming big bdata arrays to Chrome separately.
+
+        Extracts large base64-encoded data values from the spec, sends the
+        lightweight skeleton via a single CDP call, then streams each large
+        bdata string in chunks that stay under both the CDP pipe-message limit
+        and V8's max string length.
+        """
+        extractions: list[tuple[int, str, str]] = []
+        fig_data = spec.get("data", {}).get("data", [])
+        for i, trace in enumerate(fig_data):
+            for key, value in list(trace.items()):
+                if (
+                    isinstance(value, dict)
+                    and "bdata" in value
+                    and len(value["bdata"]) > _CHUNK_SIZE
+                ):
+                    extractions.append((i, key, value["bdata"]))
+                    trace[key] = {**value, "bdata": ""}
+
+        await _dtools.exec_js_fn(
+            self.tab,
+            self._current_js_id,
+            r"function(spec, ...args)"
+            r"{ window.__kaleido_spec = spec;"
+            r"  window.__kaleido_args = args; }",
+            spec,
+            topojson,
+            stepper,
+        )
+
+        for trace_idx, key, bdata in extractions:
+            chunks = [
+                bdata[j : j + _CHUNK_SIZE]
+                for j in range(0, len(bdata), _CHUNK_SIZE)
+            ]
+            await _dtools.exec_js_fn(
+                self.tab,
+                self._current_js_id,
+                r"function() { window.__kaleido_bd = []; }",
+            )
+            for chunk in chunks:
+                await _dtools.exec_js_fn(
+                    self.tab,
+                    self._current_js_id,
+                    r"function(c) { window.__kaleido_bd.push(c); }",
+                    chunk,
+                )
+            await _dtools.exec_js_fn(
+                self.tab,
+                self._current_js_id,
+                f"function() {{"
+                f"window.__kaleido_spec.data.data[{trace_idx}]"
+                f"['{key}'].bdata = window.__kaleido_bd.join('');"
+                f"delete window.__kaleido_bd;"
+                f"}}",
+            )
+
+        return await _dtools.exec_js_fn(
+            self.tab,
+            self._current_js_id,
+            r"function()"
+            r"{ var s = window.__kaleido_spec,"
+            r"      a = window.__kaleido_args;"
+            r"  delete window.__kaleido_spec;"
+            r"  delete window.__kaleido_args;"
+            r"  return kaleido_scopes.plotly(s, ...a).then(JSON.stringify); }",
+        )
